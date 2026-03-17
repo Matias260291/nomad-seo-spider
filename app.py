@@ -355,15 +355,47 @@ if run and start_url:
 
         df = pd.DataFrame(results)
 
+        # ── Garantizar que todas las columnas existen (aunque haya errores) ──
+        STR_COLS = ["title", "meta_description", "h1", "h2_sample", "robots_meta",
+                    "canonical", "hreflang", "og_title", "og_description",
+                    "og_image", "og_type", "schema_types", "redirect_chain",
+                    "content_type", "final_url", "rel_next", "rel_prev",
+                    "title_issues", "meta_desc_issues", "error"]
+        INT_COLS = ["title_length", "meta_desc_length", "h1_count", "h2_count",
+                    "h3_count", "hreflang_count", "word_count",
+                    "internal_links_count", "external_links_count",
+                    "nofollow_links_count", "images_total", "images_no_alt"]
+        BOOL_COLS = ["is_redirect", "is_noindex", "is_self_canonical"]
+
+        for col in STR_COLS:
+            if col not in df.columns:
+                df[col] = ""
+        for col in INT_COLS:
+            if col not in df.columns:
+                df[col] = 0
+        for col in BOOL_COLS:
+            if col not in df.columns:
+                df[col] = False
+
+        # Asegurar tipos correctos
+        for col in STR_COLS:
+            df[col] = df[col].fillna("").astype(str)
+        for col in INT_COLS:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+        for col in BOOL_COLS:
+            df[col] = df[col].fillna(False).astype(bool)
+
+        df["status_code"] = pd.to_numeric(df["status_code"], errors="coerce").fillna(0).astype(int)
+
         # ── Métricas rápidas ──────────────────────────────────────────────
         st.markdown("---")
         st.subheader("📊 Resumen")
 
         col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("URLs rastreadas",   len(df))
-        col2.metric("2xx OK",            int(df["status_code"].between(200,299).sum()))
-        col3.metric("3xx Redirects",     int(df["status_code"].between(300,399).sum()))
-        col4.metric("4xx Errors",        int(df["status_code"].between(400,499).sum()))
+        col2.metric("2xx OK",            int(df["status_code"].between(200, 299).sum()))
+        col3.metric("3xx Redirects",     int(df["status_code"].between(300, 399).sum()))
+        col4.metric("4xx Errors",        int(df["status_code"].between(400, 499).sum()))
         col5.metric("Sin título",        int(df["title"].str.strip().eq("").sum()))
 
         # ── Issues ───────────────────────────────────────────────────────
@@ -377,9 +409,10 @@ if run and start_url:
 
         # ── Preview data ─────────────────────────────────────────────────
         st.subheader("🔍 Vista previa de datos")
-        preview_cols = ["url", "status_code", "title", "title_length",
-                        "meta_desc_length", "h1_count", "word_count",
-                        "is_noindex", "canonical", "schema_types"]
+        ALL_PREVIEW = ["url", "status_code", "title", "title_length",
+                       "meta_desc_length", "h1_count", "word_count",
+                       "is_noindex", "canonical", "schema_types"]
+        preview_cols = [c for c in ALL_PREVIEW if c in clean.columns]
         st.dataframe(
             clean[preview_cols].head(100),
             use_container_width=True, hide_index=True
