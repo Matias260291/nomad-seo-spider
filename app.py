@@ -16,12 +16,13 @@ import streamlit as st
 import pandas as pd
 from bs4 import BeautifulSoup
 
-# ── Patch para asyncio en entornos con loop ya corriendo ────────────────────
-try:
-    import nest_asyncio
-    nest_asyncio.apply()
-except ImportError:
-    pass
+import concurrent.futures
+
+def run_async(coro):
+    """Ejecuta coroutine async desde Streamlit sin conflicto de event loop."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(asyncio.run, coro)
+        return future.result()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -345,7 +346,7 @@ if run and start_url:
         st.info(f"Rastreando **{start_url}** · máx. {max_pages} URLs · profundidad {max_depth}")
 
         with st.spinner("Crawl en progreso..."):
-            results = asyncio.run(run_spider(
+            results = run_async(run_spider(
                 start_url, max_pages, max_depth, concurrency,
                 respect_noindex, progress_bar, status_text
             ))
