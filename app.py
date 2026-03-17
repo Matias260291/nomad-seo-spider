@@ -1,28 +1,22 @@
 """
 SEO Spider — Web App
-Stack: Streamlit + aiohttp + BeautifulSoup
+Stack: Streamlit + requests + BeautifulSoup + ThreadPoolExecutor
 Deploy: Streamlit Cloud (gratis)
 """
 
-import asyncio
-import aiohttp
 import re
 import time
 import io
+import queue
+import threading
 from collections import deque
 from urllib.parse import urljoin, urlparse, urlunparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
 import streamlit as st
 import pandas as pd
 from bs4 import BeautifulSoup
-
-import concurrent.futures
-
-def run_async(coro):
-    """Ejecuta coroutine async desde Streamlit sin conflicto de event loop."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(asyncio.run, coro)
-        return future.result()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -53,9 +47,47 @@ EXCLUDE_PATTERNS = [
     r"/(tag|autor|author|feed|wp-json|wp-admin|xmlrpc)/",
 ]
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    )
+}
+
 
 # ════════════════════════════════════════════════════════════════════════════
-#  EXTRACCIÓN SEO
+#  FETCH (sincrono, con requests)
+# ════════════════════════════════════════════════════════════════════════════
+
+def fetch_url(url, timeout=20):
+    redirect_chain = []
+    try:
+        t0 = time.perf_counter()
+        resp = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+        elapsed = round(time.perf_counter() - t0, 3)
+        for r in resp.history:
+            redirect_chain.append(str(r.url))
+        redirect_chain.append(str(resp.url))
+        ct = resp.headers.get("content-type", "")
+        if "html" not in ct:
+            return {"url": url, "final_url": str(resp.url),
+                    "status_code": resp.status_code, "response_time": elapsed,
+                    "content_type": ct, "html": "", "redirect_chain": redirect_chain}
+        return {"url": url, "final_url": str(resp.url),
+                "status_code": resp.status_code, "response_time": elapsed,
+                "content_type": ct, "html": resp.text,
+                "redirect_chain": redirect_chain}
+    except requests.exceptions.Timeout:
+        return {"url": url, "error": "TIMEOUT", "status_code": None,
+                "html": "", "redirect_chain": [], "final_url": url}
+    except Exception as e:
+        return {"url": url, "error": str(e)[:120], "status_code": None,
+                "html": "", "redirect_chain": [], "final_url": url}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  EXTRACCION SEO
 # ════════════════════════════════════════════════════════════════════════════
 
 def extract_seo(url, fetch, domain):
@@ -66,7 +98,7 @@ def extract_seo(url, fetch, domain):
         "response_time_s": fetch.get("response_time"),
         "content_type": fetch.get("content_type", ""),
         "is_redirect": url != fetch.get("final_url", url),
-        "redirect_chain": " → ".join(fetch.get("redirect_chain", [])),
+        "redirect_chain": " > ".join(fetch.get("redirect_chain", [])),
         "error": fetch.get("error", ""),
     }
 
@@ -109,8 +141,8 @@ def extract_seo(url, fetch, domain):
         schema_types.extend(m)
     schema_types_str = ", ".join(sorted(set(schema_types)))
 
-    body       = soup.find("body")
-    word_count = len(body.get_text(" ", strip=True).split()) if body else 0
+    body        = soup.find("body")
+    word_count  = len(body.get_text(" ", strip=True).split()) if body else 0
 
     internal_links, external_links, nofollow_links = [], [], []
     for a in soup.find_all("a", href=True):
@@ -129,7 +161,7 @@ def extract_seo(url, fetch, domain):
         else:
             external_links.append(norm)
 
-    images     = soup.find_all("img")
+    images      = soup.find_all("img")
     imgs_no_alt = sum(1 for img in images if not img.get("alt", "").strip())
 
     next_link = soup.find("link", attrs={"rel": "next"})
@@ -162,86 +194,65 @@ def extract_seo(url, fetch, domain):
 
 
 def _issues_title(t):
-    if not t: return "AUSENTE"
-    if len(t) < 30: return "MUY_CORTO"
-    if len(t) > 60: return "MUY_LARGO"
+    if not t:        return "AUSENTE"
+    if len(t) < 30:  return "MUY_CORTO"
+    if len(t) > 60:  return "MUY_LARGO"
     return ""
 
 def _issues_meta(d):
-    if not d: return "AUSENTE"
-    if len(d) < 70: return "MUY_CORTA"
+    if not d:        return "AUSENTE"
+    if len(d) < 70:  return "MUY_CORTA"
     if len(d) > 160: return "MUY_LARGA"
     return ""
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  FETCH ASYNC
+#  SPIDER (BFS + ThreadPoolExecutor - 100% sincrono, sin asyncio)
 # ════════════════════════════════════════════════════════════════════════════
 
-async def fetch_url(session, url, timeout):
-    redirect_chain = []
-    try:
-        t0 = time.perf_counter()
-        async with session.get(
-            url, allow_redirects=True,
-            timeout=aiohttp.ClientTimeout(total=timeout), max_redirects=10,
-        ) as resp:
-            elapsed = round(time.perf_counter() - t0, 3)
-            for hist in resp.history:
-                redirect_chain.append(str(hist.url))
-            redirect_chain.append(str(resp.url))
-            ct = resp.headers.get("content-type", "")
-            if "html" not in ct:
-                return {"url": url, "final_url": str(resp.url),
-                        "status_code": resp.status, "response_time": elapsed,
-                        "content_type": ct, "html": "", "redirect_chain": redirect_chain}
-            html = await resp.text(errors="replace")
-            return {"url": url, "final_url": str(resp.url),
-                    "status_code": resp.status, "response_time": elapsed,
-                    "content_type": ct, "html": html, "redirect_chain": redirect_chain}
-    except asyncio.TimeoutError:
-        return {"url": url, "error": "TIMEOUT", "status_code": None}
-    except Exception as e:
-        return {"url": url, "error": str(e)[:120], "status_code": None}
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  SPIDER
-# ════════════════════════════════════════════════════════════════════════════
-
-async def run_spider(start_url, max_pages, max_depth, concurrency,
-                     respect_noindex, progress_bar, status_text):
-    domain  = urlparse(start_url).netloc.lower().lstrip("www.")
-    visited = set()
-    queue   = deque()
-    results = []
+def run_spider(start_url, max_pages, max_depth, concurrency,
+               respect_noindex, progress_queue):
+    domain   = urlparse(start_url).netloc.lower().lstrip("www.")
+    visited  = set()
+    frontier = deque()
+    results  = []
 
     start_norm = normalize_url(start_url)
-    queue.append((start_norm, 0))
+    frontier.append((start_norm, 0))
     visited.add(start_norm)
 
-    connector = aiohttp.TCPConnector(limit=concurrency, ssl=False)
-    headers   = {"User-Agent": "Mozilla/5.0 (compatible; NomadSEOSpider/1.0)"}
-
-    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-        while queue and len(results) < max_pages:
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        while frontier and len(results) < max_pages:
             batch = []
-            while queue and len(batch) < concurrency:
-                batch.append(queue.popleft())
+            while frontier and len(batch) < concurrency:
+                batch.append(frontier.popleft())
 
-            tasks   = [fetch_url(session, url, 20) for url, _ in batch]
-            fetched = await asyncio.gather(*tasks)
+            future_map = {
+                executor.submit(fetch_url, url): (url, depth)
+                for url, depth in batch
+            }
 
-            for (url, depth), fetch_result in zip(batch, fetched):
+            for future in as_completed(future_map):
+                url, depth = future_map[future]
+                try:
+                    fetch_result = future.result()
+                except Exception as e:
+                    fetch_result = {"url": url, "error": str(e), "html": "",
+                                    "status_code": None, "final_url": url,
+                                    "redirect_chain": []}
+
                 seo_data = extract_seo(url, fetch_result, domain)
                 results.append(seo_data)
 
-                pct = min(len(results) / max_pages, 1.0)
-                progress_bar.progress(pct)
-                status_text.text(
-                    f"🕷 {len(results)}/{max_pages} — "
-                    f"[{seo_data.get('status_code','?')}] {url[-70:]}"
-                )
+                progress_queue.put({
+                    "done": len(results),
+                    "total": max_pages,
+                    "url": url,
+                    "status": seo_data.get("status_code", "ERR"),
+                })
+
+                if len(results) >= max_pages:
+                    break
 
                 if respect_noindex and seo_data.get("is_noindex"):
                     continue
@@ -253,30 +264,29 @@ async def run_spider(start_url, max_pages, max_depth, concurrency,
                                 and not should_exclude(norm, EXCLUDE_PATTERNS)
                                 and len(visited) < max_pages * 3):
                             visited.add(norm)
-                            queue.append((norm, depth + 1))
+                            frontier.append((norm, depth + 1))
 
-            await asyncio.sleep(0.05)
-
+    progress_queue.put(None)
     return results
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  RESUMEN ISSUES
+#  HELPERS DE DATOS
 # ════════════════════════════════════════════════════════════════════════════
 
 def build_issues_summary(df):
     checks = {
-        "Sin título":             df["title"].str.strip().eq(""),
-        "Título muy largo (>60)": df["title_length"].gt(60),
-        "Título muy corto (<30)": df["title_length"].gt(0) & df["title_length"].lt(30),
+        "Sin titulo":             df["title"].str.strip().eq(""),
+        "Titulo muy largo (>60)": df["title_length"].gt(60),
+        "Titulo muy corto (<30)": df["title_length"].gt(0) & df["title_length"].lt(30),
         "Sin meta description":   df["meta_description"].str.strip().eq(""),
         "Meta desc muy larga":    df["meta_desc_length"].gt(160),
         "Sin H1":                 df["h1_count"].eq(0),
-        "Múltiples H1":           df["h1_count"].gt(1),
+        "Multiples H1":           df["h1_count"].gt(1),
         "Noindex":                df["is_noindex"].eq(True),
         "Sin canonical":          df["canonical"].str.strip().eq(""),
         "Canonical no self":      df["is_self_canonical"].eq(False),
-        "Imágenes sin alt":       df["images_no_alt"].gt(0),
+        "Imagenes sin alt":       df["images_no_alt"].gt(0),
         "4xx":                    df["status_code"].between(400, 499),
         "5xx":                    df["status_code"].between(500, 599),
         "Redirect (3xx)":         df["status_code"].between(300, 399),
@@ -291,17 +301,43 @@ def build_issues_summary(df):
     return pd.DataFrame(rows).sort_values("URLs afectadas", ascending=False)
 
 
+def normalize_df(df):
+    STR_COLS  = ["title", "meta_description", "h1", "h2_sample", "robots_meta",
+                 "canonical", "hreflang", "og_title", "og_description",
+                 "og_image", "og_type", "schema_types", "redirect_chain",
+                 "content_type", "final_url", "rel_next", "rel_prev",
+                 "title_issues", "meta_desc_issues", "error"]
+    INT_COLS  = ["title_length", "meta_desc_length", "h1_count", "h2_count",
+                 "h3_count", "hreflang_count", "word_count",
+                 "internal_links_count", "external_links_count",
+                 "nofollow_links_count", "images_total", "images_no_alt"]
+    BOOL_COLS = ["is_redirect", "is_noindex", "is_self_canonical"]
+
+    for col in STR_COLS:
+        if col not in df.columns: df[col] = ""
+        df[col] = df[col].fillna("").astype(str)
+    for col in INT_COLS:
+        if col not in df.columns: df[col] = 0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    for col in BOOL_COLS:
+        if col not in df.columns: df[col] = False
+        df[col] = df[col].fillna(False).astype(bool)
+    df["status_code"] = pd.to_numeric(df.get("status_code", 0), errors="coerce").fillna(0).astype(int)
+    return df
+
+
 def to_excel_bytes(df):
     output = io.BytesIO()
+    clean  = df.drop(columns=["internal_links_raw"], errors="ignore")
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        clean = df.drop(columns=["internal_links_raw"], errors="ignore")
         clean.to_excel(writer, index=False, sheet_name="Crawl")
         build_issues_summary(clean).to_excel(writer, index=False, sheet_name="Issues")
-        df[df["is_redirect"] == True][
+        clean[clean["is_redirect"]== True][
             ["url","final_url","status_code","redirect_chain"]
         ].to_excel(writer, index=False, sheet_name="Redirects")
-        err = df[df["error"].astype(str).str.len() > 0][["url","status_code","error"]]
-        err.to_excel(writer, index=False, sheet_name="Errors")
+        clean[clean["error"].astype(str).str.len() > 0][
+            ["url","status_code","error"]
+        ].to_excel(writer, index=False, sheet_name="Errors")
     return output.getvalue()
 
 
@@ -309,123 +345,90 @@ def to_excel_bytes(df):
 #  UI STREAMLIT
 # ════════════════════════════════════════════════════════════════════════════
 
-st.set_page_config(
-    page_title="Nomad SEO Spider",
-    page_icon="🕷",
-    layout="wide",
-)
-
+st.set_page_config(page_title="Nomad SEO Spider", page_icon="🕷", layout="wide")
 st.title("🕷 Nomad SEO Spider")
 st.caption("Herramienta interna Nomadic · alternativa a Screaming Frog")
 
-# ── Sidebar: configuración ───────────────────────────────────────────────────
 with st.sidebar:
-    st.header("⚙️ Configuración")
-
-    start_url = st.text_input(
-        "URL de inicio", placeholder="https://cliente.com"
-    )
-    max_pages = st.slider("Máx. URLs a rastrear", 50, 2000, 500, step=50)
-    max_depth = st.slider("Profundidad máxima", 1, 10, 5)
-    concurrency = st.slider("Concurrencia (requests simultáneos)", 3, 30, 10)
+    st.header("Configuracion")
+    start_url       = st.text_input("URL de inicio", placeholder="https://cliente.com")
+    max_pages       = st.slider("Max. URLs a rastrear", 50, 2000, 500, step=50)
+    max_depth       = st.slider("Profundidad maxima", 1, 10, 5)
+    concurrency     = st.slider("Concurrencia (requests simultaneos)", 3, 20, 8)
     respect_noindex = st.checkbox("Respetar noindex (no seguir)", value=True)
-
     st.markdown("---")
-    st.markdown("**Cómo usar:**")
-    st.markdown("1. Ingresá la URL del sitio\n2. Ajustá los parámetros\n3. Presioná **Iniciar crawl**\n4. Descargá el Excel al finalizar")
+    st.markdown("**Como usar:**\n1. Ingresa la URL\n2. Ajusta parametros\n3. Presiona **Iniciar crawl**\n4. Descarga el Excel")
 
-# ── Main area ────────────────────────────────────────────────────────────────
-run = st.button("🚀 Iniciar crawl", type="primary", disabled=not start_url)
+run = st.button("Iniciar crawl", type="primary", disabled=not start_url)
 
 if run and start_url:
     if not start_url.startswith("http"):
         st.error("La URL debe empezar con http:// o https://")
     else:
+        st.info(f"Rastreando **{start_url}** - max. {max_pages} URLs - profundidad {max_depth}")
         progress_bar = st.progress(0.0)
         status_text  = st.empty()
-        st.info(f"Rastreando **{start_url}** · máx. {max_pages} URLs · profundidad {max_depth}")
 
-        with st.spinner("Crawl en progreso..."):
-            results = run_async(run_spider(
-                start_url, max_pages, max_depth, concurrency,
-                respect_noindex, progress_bar, status_text
-            ))
+        pq = queue.Queue()
+        results_holder = []
+
+        def spider_thread():
+            data = run_spider(
+                start_url, max_pages, max_depth,
+                concurrency, respect_noindex, pq
+            )
+            results_holder.extend(data)
+
+        t = threading.Thread(target=spider_thread, daemon=True)
+        t.start()
+
+        while True:
+            msg = pq.get()
+            if msg is None:
+                break
+            pct = min(msg["done"] / msg["total"], 1.0)
+            progress_bar.progress(pct)
+            status_text.text(
+                f"Procesando {msg['done']}/{msg['total']}  [{msg['status']}]  {msg['url'][-80:]}"
+            )
+
+        t.join()
 
         progress_bar.progress(1.0)
-        status_text.text(f"✅ Crawl completo — {len(results)} URLs procesadas")
+        status_text.text(f"Crawl completo - {len(results_holder)} URLs procesadas")
 
-        df = pd.DataFrame(results)
+        df = normalize_df(pd.DataFrame(results_holder))
 
-        # ── Garantizar que todas las columnas existen (aunque haya errores) ──
-        STR_COLS = ["title", "meta_description", "h1", "h2_sample", "robots_meta",
-                    "canonical", "hreflang", "og_title", "og_description",
-                    "og_image", "og_type", "schema_types", "redirect_chain",
-                    "content_type", "final_url", "rel_next", "rel_prev",
-                    "title_issues", "meta_desc_issues", "error"]
-        INT_COLS = ["title_length", "meta_desc_length", "h1_count", "h2_count",
-                    "h3_count", "hreflang_count", "word_count",
-                    "internal_links_count", "external_links_count",
-                    "nofollow_links_count", "images_total", "images_no_alt"]
-        BOOL_COLS = ["is_redirect", "is_noindex", "is_self_canonical"]
-
-        for col in STR_COLS:
-            if col not in df.columns:
-                df[col] = ""
-        for col in INT_COLS:
-            if col not in df.columns:
-                df[col] = 0
-        for col in BOOL_COLS:
-            if col not in df.columns:
-                df[col] = False
-
-        # Asegurar tipos correctos
-        for col in STR_COLS:
-            df[col] = df[col].fillna("").astype(str)
-        for col in INT_COLS:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-        for col in BOOL_COLS:
-            df[col] = df[col].fillna(False).astype(bool)
-
-        df["status_code"] = pd.to_numeric(df["status_code"], errors="coerce").fillna(0).astype(int)
-
-        # ── Métricas rápidas ──────────────────────────────────────────────
         st.markdown("---")
-        st.subheader("📊 Resumen")
+        st.subheader("Resumen")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("URLs rastreadas", len(df))
+        c2.metric("2xx OK",          int(df["status_code"].between(200, 299).sum()))
+        c3.metric("3xx Redirects",   int(df["status_code"].between(300, 399).sum()))
+        c4.metric("4xx Errors",      int(df["status_code"].between(400, 499).sum()))
+        c5.metric("Sin titulo",      int(df["title"].str.strip().eq("").sum()))
 
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("URLs rastreadas",   len(df))
-        col2.metric("2xx OK",            int(df["status_code"].between(200, 299).sum()))
-        col3.metric("3xx Redirects",     int(df["status_code"].between(300, 399).sum()))
-        col4.metric("4xx Errors",        int(df["status_code"].between(400, 499).sum()))
-        col5.metric("Sin título",        int(df["title"].str.strip().eq("").sum()))
-
-        # ── Issues ───────────────────────────────────────────────────────
-        st.subheader("⚠️ Issues detectados")
-        clean = df.drop(columns=["internal_links_raw"], errors="ignore")
+        st.subheader("Issues detectados")
+        clean     = df.drop(columns=["internal_links_raw"], errors="ignore")
         issues_df = build_issues_summary(clean)
         if issues_df.empty:
-            st.success("No se detectaron issues relevantes 🎉")
+            st.success("No se detectaron issues relevantes")
         else:
             st.dataframe(issues_df, use_container_width=True, hide_index=True)
 
-        # ── Preview data ─────────────────────────────────────────────────
-        st.subheader("🔍 Vista previa de datos")
-        ALL_PREVIEW = ["url", "status_code", "title", "title_length",
-                       "meta_desc_length", "h1_count", "word_count",
-                       "is_noindex", "canonical", "schema_types"]
-        preview_cols = [c for c in ALL_PREVIEW if c in clean.columns]
-        st.dataframe(
-            clean[preview_cols].head(100),
-            use_container_width=True, hide_index=True
-        )
+        st.subheader("Vista previa de datos")
+        PREVIEW      = ["url","status_code","title","title_length",
+                        "meta_desc_length","h1_count","word_count",
+                        "is_noindex","canonical","schema_types"]
+        preview_cols = [c for c in PREVIEW if c in clean.columns]
+        st.dataframe(clean[preview_cols].head(100),
+                     use_container_width=True, hide_index=True)
 
-        # ── Descarga ─────────────────────────────────────────────────────
         st.markdown("---")
-        domain_slug = urlparse(start_url).netloc.replace("www.", "").replace(".", "_")
-        filename    = f"seo_crawl_{domain_slug}.xlsx"
-
+        slug     = urlparse(start_url).netloc.replace("www.", "").replace(".", "_")
+        filename = f"seo_crawl_{slug}.xlsx"
         st.download_button(
-            label="📥 Descargar Excel completo",
+            label="Descargar Excel completo",
             data=to_excel_bytes(clean),
             file_name=filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -434,17 +437,17 @@ if run and start_url:
 
 elif not run:
     st.markdown("""
-    ### Qué analiza esta herramienta
+    ### Que analiza esta herramienta
 
-    | Categoría | Datos extraídos |
+    | Categoria | Datos extraidos |
     |---|---|
     | HTTP | Status code, tiempo de respuesta, cadena de redirecciones |
-    | On-page | Título, meta description, H1/H2/H3 |
-    | Indexación | Robots meta, noindex, canonical, hreflang |
-    | Social | Open Graph (título, descripción, imagen, tipo) |
+    | On-page | Titulo, meta description, H1/H2/H3 |
+    | Indexacion | Robots meta, noindex, canonical, hreflang |
+    | Social | Open Graph (titulo, descripcion, imagen, tipo) |
     | Schema | Tipos de structured data detectados |
     | Contenido | Word count |
     | Links | Internos, externos, nofollow |
-    | Imágenes | Total, sin atributo alt |
-    | Paginación | rel=next / rel=prev |
+    | Imagenes | Total, sin atributo alt |
+    | Paginacion | rel=next / rel=prev |
     """)
